@@ -21,14 +21,13 @@ import copy
 import getpass
 import json
 import math
-from . import qutils as qu
 
 from collections import namedtuple
 from subprocess import Popen, PIPE
 from typing import Optional, Any
+from functools import cached_property
 from monty.string import is_string, list_strings
 from monty.collections import AttrDict
-from monty.functools import lazy_property
 from monty.inspect import all_subclasses
 from monty.io import FileLock
 from monty.json import MSONable
@@ -38,6 +37,7 @@ from .utils import Condition
 from .launcher import ScriptEditor
 from .qjobs import QueueJob
 from .qutils import any2mb
+from . import qutils as qu
 
 import logging
 logger = logging.getLogger(__name__)
@@ -59,7 +59,7 @@ class SubmitResults(namedtuple("SubmitResult", "qid, out, err, process")):
     submitting the jobfile to the que.
     qid: queue id of the submission
     out: stdout of the submission
-    err: stdrr of the submisison
+    err: stdrr of the submission
     process: process object of the submission
     """
 
@@ -259,7 +259,7 @@ class Hardware:
         try:
             # old pymatgen
             mem_per_node = str(Memory(val=self.mem_per_node, unit='Mb'))
-        except:
+        except UnitError:
             mem_per_node = str(Memory(val=self.mem_per_node, unit='MB'))
 
         return {'num_nodes': self.num_nodes,
@@ -286,7 +286,8 @@ class _ExcludeNodesFile:
 
     def __init__(self):
         if not os.path.exists(self.FILEPATH):
-            if not os.path.exists(self.DIRPATH): os.makedirs(self.DIRPATH)
+            if not os.path.exists(self.DIRPATH):
+                os.makedirs(self.DIRPATH,exist_ok=True)
             with FileLock(self.FILEPATH):
                 with open(self.FILEPATH, "w") as fh:
                     json.dump({}, fh)
@@ -404,7 +405,7 @@ hardware:
                          # The total number of cores available on this queue is
                          # `num_nodes * sockets_per_node * cores_per_socket`.
 
-# Dictionary with the options used to prepare the enviroment before submitting the job
+# Dictionary with the options used to prepare the environment before submitting the job
 
 job:
     setup:                # List of commands (strings) executed before running (DEFAULT: empty)
@@ -461,7 +462,7 @@ limits:
                              # smallest number of nodes compatible with the optimal configuration.
                              # Use `force_nodes` to enforce entire nodes allocation.
                              # `shared` mode does not enforce any constraint (DEFAULT: shared).
-    max_num_launches:        # Limit to the number of times a specific task can be restarted (integer, DEFAULT: 5)
+    max_num_launches:        # Limit to the number of times a specific task can be restarted (integer, DEFAULT: 8)
     limits_for_task_class:   # Dictionary mapping Task class names to a dictionary with limits to be used
                              # for this particular Task. Example (mind white spaces):
                              #
@@ -630,12 +631,12 @@ limits:
             raise ValueError("min_cores %s cannot be greater than max_cores %s" % (self.min_cores, self.max_cores))
 
         # Memory
-        # FIXME: Neeed because autoparal 1 with paral_kgb 1 is not able to estimate memory
+        # FIXME: Needed because autoparal 1 with paral_kgb 1 is not able to estimate memory
         self.min_mem_per_proc = qu.any2mb(d.pop("min_mem_per_proc", self.hw.mem_per_core))
         self.max_mem_per_proc = qu.any2mb(d.pop("max_mem_per_proc", self.hw.mem_per_node))
 
         # Misc
-        self.max_num_launches = int(d.pop("max_num_launches", 5))
+        self.max_num_launches = int(d.pop("max_num_launches", 8))
         self.condition = Condition(d.pop("condition", {}))
         self.allocation = d.pop("allocation", "shared")
         if self.allocation not in ("nodes", "force_nodes", "shared"):
@@ -721,7 +722,7 @@ limits:
         """Dictionary with the parameters used to construct the header."""
         return self._qparams
 
-    @lazy_property
+    @cached_property
     def supported_qparams(self) -> list:
         """
         List with the supported parameters that can be passed to the
@@ -1043,7 +1044,7 @@ limits:
 
     def get_script_str(self, job_name: str, launch_dir: str,
                        executable: str, qout_path: str, qerr_path: str,
-                       in_file: str=None, stdin=None, stdout=None, stderr=None, exec_args=None) -> str:
+                       in_file: str = None, stdin=None, stdout=None, stderr=None, exec_args=None) -> str:
         """
         Returns a (multi-line) String representing the queue script, e.g. PBS script.
         Uses the template_file along with internal parameters to create the script.
@@ -1115,6 +1116,17 @@ limits:
 
         return qheader + se.get_script_str() + "\n"
 
+    def check_num_launches(self):
+        """
+        Verify that we have not reached the maximum number of launches.
+
+        Raises:
+            `self.MaxNumLaunchesError` if we have already tried to submit the job max_num_launches
+            `self.Error` if generic error
+        """
+        if self.num_launches == self.max_num_launches:
+            raise self.MaxNumLaunchesError("num_launches %s == max_num_launches %s" % (self.num_launches, self.max_num_launches))
+
     def submit_to_queue(self, script_file: str) -> QueueJob:
         """
         Public API: wraps the concrete implementation _submit_to_queue
@@ -1126,8 +1138,7 @@ limits:
         if not os.path.exists(script_file):
             raise self.Error('Cannot find script file located at: {}'.format(script_file))
 
-        if self.num_launches == self.max_num_launches:
-            raise self.MaxNumLaunchesError("num_launches %s == max_num_launches %s" % (self.num_launches, self.max_num_launches))
+        self.check_num_launches()
 
         # Call the concrete implementation.
         s = self._submit_to_queue(script_file)

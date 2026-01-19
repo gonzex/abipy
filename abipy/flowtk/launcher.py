@@ -6,30 +6,25 @@ import abc
 import os
 import time
 import datetime
-import pandas as pd
 import apscheduler
+import pandas as pd
 
 from collections import deque
 from io import StringIO
 from queue import Queue, Empty
 from typing import Optional
 from shutil import which
+from functools import cached_property
 from monty.io import get_open_fds
 from monty.string import boxed, is_string
-from monty.collections import AttrDict #, dict2namedtuple
+from monty.collections import AttrDict
 from monty.termcolor import cprint
-from monty.functools import lazy_property
 from abipy.tools.iotools import yaml_safe_load, ask_yesno
 from abipy.tools.typing import TYPE_CHECKING
 from .utils import as_bool
 
 import logging
 logger = logging.getLogger(__name__)
-
-#try:
-#    has_sched_v3 = apscheduler.version >= "3.0.0"
-#except AttributeError:
-#    has_sched_v3 = False
 
 if TYPE_CHECKING:  # needed to avoid circular imports
     from .tasks import Task
@@ -49,7 +44,6 @@ def straceback() -> str:
     """Returns a string with the traceback."""
     import traceback
     return traceback.format_exc()
-
 
 
 class ScriptEditor:
@@ -196,7 +190,7 @@ class PyLauncher:
 
         return num_launched
 
-    def rapidfire(self, max_nlaunch=-1, max_loops=1, sleep_time=5):
+    def rapidfire(self, max_nlaunch=-1, max_loops=1, sleep_time=5, max_ncores_used=None):
         """
         Keeps submitting `Tasks` until we are out of jobs or no job is ready to run.
 
@@ -208,7 +202,10 @@ class PyLauncher:
         Returns:
             The number of tasks launched.
         """
-        num_launched, do_exit, launched = 0, False, []
+        num_launched, ncores_used, do_exit, launched = 0, 0, False, []
+
+        if max_ncores_used is None:
+            max_ncores_used = float('inf')
 
         for count in range(max_loops):
             if do_exit: break
@@ -226,10 +223,18 @@ class PyLauncher:
             if not tasks: continue
 
             for task in tasks:
+
+                # Check that we do not exceed number of cores
+                if (ncores_used + task.manager.num_cores) > max_ncores_used:
+                    logger.info('reached max_ncores_used, breaking submission loop')
+                    do_exit = True
+                    break
+
                 fired = task.start()
                 if fired:
                     launched.append(task)
                     num_launched += 1
+                    ncores_used += task.manager.num_cores
 
                 if num_launched >= max_nlaunch > 0:
                     logger.info('num_launched >= max_nlaunch, breaking submission loop')
@@ -391,7 +396,7 @@ class BaseScheduler(metaclass=abc.ABCMeta):
 
     @classmethod
     def from_string(cls, s: str) -> BaseScheduler:
-        """Create an istance from string s containing a YAML dictionary."""
+        """Create an instance from string s containing a YAML dictionary."""
         stream = StringIO(s)
         stream.seek(0)
         return cls(**yaml_safe_load(stream))
@@ -471,7 +476,7 @@ killjobs_if_errors: yes # "yes" if the scheduler should try to kill all the runn
     def callback(self):
         """The function that will be executed by the scheduler."""
 
-    @lazy_property
+    @cached_property
     def pid(self) -> int:
         """The pid of the process associated to the scheduler."""
         return os.getpid()
@@ -517,6 +522,7 @@ killjobs_if_errors: yes # "yes" if the scheduler should try to kill all the runn
         for task in flow.unconverged_tasks:
             try:
                 logger.info("Trying to restart task: `%s`" % repr(task))
+                task.manager.qadapter.check_num_launches()  # First check number of launches.
                 fired = task.restart()
                 if fired:
                     self.nlaunch += 1
@@ -535,7 +541,7 @@ killjobs_if_errors: yes # "yes" if the scheduler should try to kill all the runn
 
         # Temporarily disabled by MG because I don't know if fix_critical works after the
         # introduction of the new qadapters
-        # reenabled by MsS disable things that do not work at low level
+        # re-enabled by MsS disable things that do not work at low level
         # fix only prepares for restarting, and sets to ready
         if self.fix_qcritical:
             nfixed = flow.fix_queue_critical()
@@ -637,7 +643,10 @@ class PyFlowScheduler(BaseScheduler):
 
         except KeyboardInterrupt:
             self.shutdown(msg="KeyboardInterrupt from user")
-            if ask_yesno("Do you want to cancel all the jobs in the queue? [Y/n]"):
+            try:
+                if ask_yesno("Do you want to cancel all the jobs in the queue? [Y/n]"):
+                    print("Number of jobs cancelled:", flow.cancel())
+            except KeyboardInterrupt:
                 print("Number of jobs cancelled:", flow.cancel())
 
             flow.pickle_dump()
@@ -666,8 +675,7 @@ class PyFlowScheduler(BaseScheduler):
                   len(list(flow.iflat_tasks(status=flow.S_SUB))))
 
         if nqjobs >= self.max_njobs_inqueue:
-            print(f"Too many jobs in the queue: {nqjobs} >= {self.max_njobs_inqueue}.\n",
-                  "No job will be submitted.")
+            print(f"Too many jobs in the queue: {nqjobs} >= {self.max_njobs_inqueue}. No job will be submitted.")
             flow.check_status(show=False)
             return
 
@@ -677,14 +685,15 @@ class PyFlowScheduler(BaseScheduler):
         # check status.
         flow.check_status(show=False)
 
-        # This check is not perfect, we should make a list of tasks to submit
-        # and then select a subset so that we don't exceeed max_ncores_used
-        # Many sections of this code should be rewritten though.
-        #if self.max_ncores_used is not None and flow.ncores_used > self.max_ncores_used:
-        if self.max_ncores_used is not None and flow.ncores_allocated > self.max_ncores_used:
-            print("Cannot exceed max_ncores_used %s" % self.max_ncores_used,
-                  ", ncores_allocated:", flow.ncores_allocated)
-            return
+        if self.max_ncores_used is not None:
+            if flow.ncores_allocated > self.max_ncores_used:
+                print("Cannot exceed max_ncores_used %s" % self.max_ncores_used,
+                      ", ncores_allocated:", flow.ncores_allocated)
+                return
+            else:
+                max_ncores_left = self.max_ncores_used - flow.ncores_allocated
+        else:
+            max_ncores_left = None
 
         # Try to restart unconverged tasks.
         max_nlaunch = self.restart_unconverged(flow, max_nlaunch, excs)
@@ -697,7 +706,9 @@ class PyFlowScheduler(BaseScheduler):
 
         # Submit the tasks that are ready.
         try:
-            nlaunch = PyLauncher(flow).rapidfire(max_nlaunch=max_nlaunch, sleep_time=10)
+            nlaunch = PyLauncher(flow).rapidfire(max_nlaunch=max_nlaunch,
+                                                 max_ncores_used=max_ncores_left,
+                                                 sleep_time=10)
             self.nlaunch += nlaunch
             if nlaunch:
                 cprint("[%s] Number of launches: %d" % (time.asctime(), nlaunch), "yellow")
@@ -839,8 +850,12 @@ class PyFlowScheduler(BaseScheduler):
             if all_ok:
                 app("Flow completed successfully")
             else:
+                try:
+                    flow.debug()
+                except:
+                    pass
                 app("Flow %s didn't complete successfully" % repr(flow.workdir))
-                app("use `abirun.py FLOWDIR debug` to analyze the problem.")
+                app("Use `abirun.py FLOWDIR debug` to analyze the problem.")
                 app("Shutdown message:\n%s" % msg)
 
             print("")
@@ -1108,14 +1123,19 @@ class MultiFlowScheduler(BaseScheduler):
                       min(self.max_njobs_inqueue - nqjobs, self.max_nlaunches)
 
         # This check is not perfect, we should make a list of tasks to submit
-        # and then select a subset so that we don't exceeed max_ncores_used
+        # and then select a subset so that we don't exceed max_ncores_used
         # Many sections of this code should be rewritten though.
         #if self.max_ncores_used is not None and flow.ncores_used > self.max_ncores_used:
         ncores_allocated = sum(flow.ncores_allocated for flow in self.flows)
-        if self.max_ncores_used is not None and ncores_allocated > self.max_ncores_used:
-            print("Cannot exceed max_ncores_used %s" % self.max_ncores_used,
-                  ", ncores_allocated:", ncores_allocated)
-            return
+        if self.max_ncores_used is not None:
+            if ncores_allocated > self.max_ncores_used:
+                print("Cannot exceed max_ncores_used %s" % self.max_ncores_used,
+                      ", ncores_allocated:", ncores_allocated)
+                return
+            else:
+                max_ncores_left = self.max_ncores_used - ncores_allocated
+        else:
+            max_ncores_left = None
 
         # Try to restart unconverged tasks.
         for flow in self.flows:
@@ -1133,7 +1153,9 @@ class MultiFlowScheduler(BaseScheduler):
             # Submit the tasks that are ready.
             try:
                 if max_nlaunch > 0:
-                    nlaunch = PyLauncher(flow).rapidfire(max_nlaunch=max_nlaunch, sleep_time=10)
+                    nlaunch = PyLauncher(flow).rapidfire(max_nlaunch=max_nlaunch,
+                                                         max_ncores_used=max_ncores_left,
+                                                         sleep_time=10)
                     self.nlaunch += nlaunch
                     max_nlaunch -= nlaunch
                     if nlaunch:

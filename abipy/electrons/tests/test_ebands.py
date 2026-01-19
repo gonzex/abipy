@@ -4,8 +4,8 @@ import numpy as np
 import unittest
 import pymatgen.core.units as units
 import abipy.data as abidata
-from abipy import abilab
 
+from abipy import abilab
 from abipy.electrons.ebands import (ElectronBands, ElectronDos, ElectronBandsPlotter, ElectronDosPlotter,
     ElectronsReader, dataframe_from_ebands, Smearing)
 from abipy.core.testing import AbipyTest
@@ -185,7 +185,7 @@ class ElectronBandsTest(AbipyTest):
             elims = [-10, 2]
             assert ni_ebands_kmesh.plot(show=False)
             assert ni_ebands_kmesh.plot_bz(show=False)
-            assert ni_ebands_kpath.plot(ylims=elims, with_gaps=True, show=False)
+            assert ni_ebands_kpath.plot(ylims=elims, with_gaps=True, with_band_index=True, show=False)
             assert ni_ebands_kpath.plot_with_edos(ni_edos, ylims=elims, show=False)
             assert ni_ebands_kpath.plot_bz(show=False)
             assert ni_ebands_kpath.plot_transitions(4.4, qpt=(0, 0, 0), atol_ev=0.1, atol_kdiff=1e-4, show=False)
@@ -256,6 +256,10 @@ class ElectronBandsTest(AbipyTest):
         assert si_ebands_kmesh.get_e0(1.0) == 1.0
         with self.assertRaises(ValueError):
             si_ebands_kmesh.get_e0("foo")
+
+        new_ebands = si_ebands_kmesh.select_kinds([0, 1])
+        assert len(new_ebands.kpoints) == 2
+        assert new_ebands.kpoints[0].is_gamma
 
         r = si_ebands_kmesh.with_points_along_path(knames=["G", "X", "L", "G"])
         assert r.ebands.kpoints.is_path
